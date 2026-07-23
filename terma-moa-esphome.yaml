@@ -260,23 +260,12 @@ sensor:
       }
       return NAN;
 
-  # Other sensors
-  - platform: wifi_signal
-    name: "WiFi Signal"
-    update_interval: 60s
-
-  - platform: uptime
-    name: "Uptime"
-    update_interval: 60s
-
 # Binary Sensors
 binary_sensor:
-  - platform: status
-    name: "Connection Status"
-
   - platform: template
     name: "Radiator BLE Connected"
     id: ble_connected_sensor
+    entity_category: diagnostic
     lambda: |-
       return id(is_connected);
 
@@ -614,18 +603,3 @@ text_sensor:
         }
       }
     update_interval: 5s
-
-  - platform: wifi_info
-    ip_address:
-      name: "IP Address"
-      entity_category: diagnostic
-    ssid:
-      name: "Connected SSID"
-      entity_category: diagnostic
-    mac_address:
-      name: "MAC Address"
-      entity_category: diagnostic
-
-  - platform: version
-    name: "ESPHome Version"
-    entity_category: diagnostic
