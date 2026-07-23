@@ -142,9 +142,11 @@ sensor:
         float current_room = (x[0] + x[1] * 256.0f) / 10.0f;
         float target_room = (x[2] + x[3] * 256.0f) / 10.0f;
         ESP_LOGD("terma", "Room - Current: %.1f°C, Target: %.1f°C", current_room, target_room);
-        // Sync the radiator's room target back into the Room Target number (like b2
-        // does for the element). publish_state doesn't trigger set_action, so no loop.
-        if (target_room >= 15.0f && target_room <= 30.0f) {
+        // Reflect the radiator's room target into the Room Target number, but only
+        // while heating - when off, leave the number showing the user's pre-set value
+        // (applied on the next turn-on) instead of overwriting it with a read.
+        // publish_state doesn't trigger set_action, so no loop.
+        if (id(power_state) && target_room >= 15.0f && target_room <= 30.0f) {
           id(room_target).publish_state(target_room);
         }
         return current_room;
@@ -173,10 +175,11 @@ sensor:
         float current_heater = (x[0] + x[1] * 256.0f) / 10.0f;
         float target_heater = (x[2] + x[3] * 256.0f) / 10.0f;
         ESP_LOGD("terma", "Heater - Current: %.1f°C, Target: %.1f°C", current_heater, target_heater);
-        // Sync the radiator's own element target (e.g. changed with the physical
-        // buttons) back into the Rail Target number. publish_state only updates the
-        // shown value - it does NOT trigger set_action, so there is no write-back loop.
-        if (target_heater >= 30.0f && target_heater <= 60.0f) {
+        // Reflect the radiator's element target into the Element Target number, but
+        // only while heating - when off, leave the number showing the user's pre-set
+        // value (applied on the next turn-on) instead of overwriting it with a read.
+        // publish_state only updates the shown value - it does NOT trigger set_action.
+        if (id(power_state) && target_heater >= 30.0f && target_heater <= 60.0f) {
           id(rail_target).publish_state(target_heater);
         }
         return current_heater;
@@ -271,10 +274,6 @@ binary_sensor:
   - platform: status
     name: "Connection Status"
 
-  - platform: ble_presence
-    mac_address: ${radiator_mac}
-    name: "Radiator BLE Presence"
-
   - platform: template
     name: "Radiator BLE Connected"
     id: ble_connected_sensor
@@ -288,18 +287,16 @@ binary_sensor:
       return id(power_state);
     device_class: heat
 
+  # Plain state: is an auto-off timer running? Timer modes are reported directly by the
+  # mode byte (room 0x03 / element 0x05 / physical 0x09), with the b6 countdown
+  # (timer_active) as a robust fallback. Compose any policy (e.g. "heating with no timer
+  # for 2h -> notify") in a Home Assistant automation using this + Heating Active.
   - platform: template
-    name: "Heating Without Timer"
-    id: heating_without_timer
-    device_class: problem
+    name: "Timer Active"
+    device_class: running
     lambda: |-
-      // True when heating in a mode that will NOT auto-off. A timer is active either
-      // via the physical timer mode (0x09) or the app/HA countdown (b6 decrementing,
-      // tracked as timer_active). Off is 0x00 / 0x20.
       int m = id(operating_mode);
-      bool off = (m == 0x00 || m == 0x20);
-      bool has_timer = id(timer_active) || (m == 0x09);
-      return (!off && !has_timer);
+      return id(timer_active) || m == 0x03 || m == 0x05 || m == 0x09;
 
 # ============================================
 # Heat mode + target temperatures
@@ -547,6 +544,31 @@ button:
           else:
             - logger.log: "Not connected - cannot start timer"
 
+  # Stop a running timer WITHOUT turning the radiator off: switch to manual
+  # (continuous) heating in the current mode (room 0x11 / element 0x21). The radiator
+  # keeps its target and just drops the auto-off countdown. Use Radiator Power to
+  # actually turn it off.
+  - platform: template
+    name: "Stop Timer"
+    icon: "mdi:timer-off"
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(is_connected);"
+          then:
+            - logger.log: "Stop Timer: switching to manual (continuous) in current mode"
+            - lambda: |-
+                bool room = id(heat_mode).current_option() == "Room";
+                id(power_state) = true;
+                id(operating_mode) = room ? 0x11 : 0x21;
+            - script.execute: push_target
+            - delay: 300ms
+            - script.execute:
+                id: set_mode
+                m: !lambda 'return id(heat_mode).current_option() == "Room" ? 0x11 : 0x21;'
+          else:
+            - logger.log: "Not connected - cannot stop timer"
+
   - platform: template
     name: "Clear BLE Bonds"
     icon: "mdi:bluetooth-off"
@@ -572,15 +594,25 @@ text_sensor:
       if (!id(is_connected)) {
         return {"Disconnected"};
       }
-      int m = id(operating_mode);
-      if (m == 0x00 || m == 0x20) {
-        return {"Standby"};
+      // The b3 operating-mode byte reports the exact mode directly (a bitfield), so we
+      // just decode it - no inference. Observed: 0x00 off, 0x20 off (remote/app),
+      // 0x01 on, 0x03 room+timer, 0x05 element+timer, 0x09 physical timer,
+      // 0x11 room+manual, 0x21 element+manual.
+      switch (id(operating_mode)) {
+        case 0x00: return {"Off"};
+        case 0x20: return {"Off (remote)"};
+        case 0x11: return {"Room - Manual"};
+        case 0x21: return {"Element - Manual"};
+        case 0x03: return {"Room - Timer"};
+        case 0x05: return {"Element - Timer"};
+        case 0x09: return {"Timer (physical)"};
+        case 0x01: return {"On"};
+        default: {
+          char buf[20];
+          snprintf(buf, sizeof(buf), "On (0x%02X)", id(operating_mode));
+          return {std::string(buf)};
+        }
       }
-      // Heating. Distinguish an auto-off timer (physical 0x09, or the b6 countdown)
-      // from continuous heating. The room/element scale is set by the Rail Target,
-      // not the mode byte, so we don't label it here.
-      bool has_timer = id(timer_active) || (m == 0x09);
-      return {has_timer ? "Heating (timer - auto-off)" : "Heating (no timer)"};
     update_interval: 5s
 
   - platform: wifi_info
