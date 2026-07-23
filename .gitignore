@@ -1,0 +1,6 @@
+# Captured debug logs (contain the radiator's BLE MAC and local network info)
+logs/
+
+# ESPHome build artifacts and local secrets
+.esphome/
+secrets.yaml

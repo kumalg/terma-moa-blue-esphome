@@ -35,8 +35,10 @@ The Terma MOA Blue is a Bluetooth-controlled electric heating element designed f
 
 ### Software
 
-- [ESPHome](https://esphome.io/) 2024.1.0 or later
+- [ESPHome](https://esphome.io/) — a reasonably recent release
 - [Home Assistant](https://www.home-assistant.io/) (optional, but recommended)
+
+This configuration targets the **ESP-IDF** framework (`esp32: framework: type: esp_idf`) and uses the native `ble_client.remove_bond` action, so use a reasonably recent ESPHome release — if `remove_bond` fails config validation, update ESPHome. The BLE encryption logic lives in a small local external component (`components/terma_moa/`) instead of the old `terma_ble_helper.h` header.
 
 ## Wiring
 
@@ -61,14 +63,14 @@ DATA   ───── GPIO4 (configurable)
 
 ### 1. Prepare the Files
 
-Copy both files to your ESPHome configuration directory:
+Copy the following into your ESPHome configuration directory, **keeping the folder layout**:
 
-- `terma-moa-blue.yaml` - Main configuration file - import into ESPHome as normal.
-- `terma_ble_helper.h` - BLE helper header file - copy to the config\esphome directory in home assistant.  Note: This file is required for persistent bluetooth connections.
+- `terma-moa-esphome.yaml` - Main configuration file - import into ESPHome as normal.
+- `components/` - The `terma_moa` external component. It must sit next to the YAML; the config references it via `external_components: [{ source: { type: local, path: components } }]`. This replaces the old `terma_ble_helper.h` and is what makes persistent, encrypted Bluetooth connections work: it automatically requests link encryption the moment the radiator connects.
 
 ### 2. Configure the YAML
 
-Edit `terma-moa-blue.yaml` and update the following:
+Edit `terma-moa-esphome.yaml` and update the following:
 
 ```yaml
 substitutions:
@@ -112,14 +114,15 @@ ap_password: "FallbackAPPassword"
 
 3. Start the device within bluetooth range of the radiator
   
-5. Monitor the logs - you should see:
+4. Monitor the logs - you should see something like:
    ```
-   BLE client connected - requesting encryption...
+   Encryption requested for bonded device
    Passkey requested by radiator - sending 123456
+   BLE client connected - encryption requested automatically
    BLE connection ready
    ```
 
-6. Once paired, the ESP32 will automatically reconnect even after power cycles
+5. Once paired, the ESP32 will automatically reconnect even after power cycles
 
 ### 5. Add to Home Assistant
 

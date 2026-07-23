@@ -3,22 +3,24 @@ substitutions:
   friendly_name: "Terma Moa BLue Radiator"
   # Replace with your Terma MOA Blue MAC address - see on android settings or the nrf connect app
   radiator_mac: "xx:xx:xx:xx:xx:xx"
-  # DHT22 data pin - change to match your wiring - Note that you may need a 10k resistor between VCC (3.3v) and GPIO4 for accurate readings (depending on which DHT22 you use with or without board)
-  dht_pin: GPIO4
 
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   platformio_options:
     board_build.flash_mode: dio
-  # Include BLE security headers
-  includes:
-    - terma_ble_helper.h
+
+# Local external component that proactively requests BLE link encryption on
+# connect (replaces the old terma_ble_helper.h + on_connect encryption lambda).
+external_components:
+  - source:
+      type: local
+      path: components
 
 esp32:
   board: esp32dev
   framework:
-    type: arduino
+    type: esp_idf
 
 # Enable logging - debug mode for first release while I complete testing
 logger:
@@ -66,15 +68,11 @@ ble_client:
     auto_connect: true
     on_connect:
       then:
-        - logger.log: "BLE client connected - requesting encryption..."
-        - lambda: |-
-            // Force encryption on the connection
-            uint8_t remote_bda[6];
-            esp_bd_addr_t bda;
-            sscanf("${radiator_mac}", "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                   &bda[0], &bda[1], &bda[2], &bda[3], &bda[4], &bda[5]);
-            esp_ble_set_encryption(bda, ESP_BLE_SEC_ENCRYPT);
-            ESP_LOGI("terma", "Encryption requested for bonded device");
+        # Encryption is now requested automatically by the terma_moa component
+        # the instant the connection opens - no lambda needed here.
+        - logger.log: "BLE client connected - encryption requested automatically"
+        # Give the encryption/bonding handshake time to complete before we
+        # treat the connection as usable.
         - delay: 2s
         - lambda: |-
             id(is_connected) = true;
@@ -96,12 +94,13 @@ ble_client:
         - lambda: |-
             id(is_connected) = false;
 
+# Terma MOA Blue helper component - automatically requests link encryption on
+# connect so the radiator will serve its (encrypted) characteristics.
+terma_moa:
+  ble_client_id: terma_moa_ble_client
+
 # Globals to store state
 globals:
-  - id: target_temp
-    type: float
-    restore_value: yes
-    initial_value: '21.0'
   - id: power_state
     type: bool
     restore_value: yes
@@ -116,31 +115,10 @@ globals:
     initial_value: '0'
 
 # ============================================
-# DHT22 Temperature & Humidity Sensor
+# BLE Sensors from Radiator
 # ============================================
 sensor:
-  # DHT22 - External temperature sensor (more accurate than radiator's built-in)
-  - platform: dht
-    pin: ${dht_pin}
-    model: DHT22
-    temperature:
-      name: "Room Temperature"
-      id: dht_temperature
-      accuracy_decimals: 1
-      filters:
-        - sliding_window_moving_average:
-            window_size: 5
-            send_every: 1
-    humidity:
-      name: "Room Humidity"
-      id: dht_humidity
-      accuracy_decimals: 0
-    update_interval: 30s
 
-  # ============================================
-  # BLE Sensors from Radiator
-  # ============================================
-  
   # Room temperature sensor (reads from b1 characteristic) - radiator's built-in sensor.  This sensor is not accurate.
   - platform: ble_client
     type: characteristic
@@ -157,13 +135,12 @@ sensor:
     device_class: temperature
     icon: "mdi:thermometer"
     lambda: |-
+      ESP_LOGD("terma", "b1 room raw (%d bytes): %s", (int) x.size(), format_hex_pretty(x).c_str());
       if (x.size() >= 4) {
-        float current_room = ((x[0] * 255.0) + x[1]) / 10.0;
-        float target_room = ((x[2] * 255.0) + x[3]) / 10.0;
+        // Little-endian uint16, value / 10 = °C (verified Terma Blue Line protocol).
+        float current_room = (x[0] + x[1] * 256.0f) / 10.0f;
+        float target_room = (x[2] + x[3] * 256.0f) / 10.0f;
         ESP_LOGD("terma", "Room - Current: %.1f°C, Target: %.1f°C", current_room, target_room);
-        if (id(operating_mode) == 5) {
-          id(target_temp) = target_room;
-        }
         return current_room;
       }
       return NAN;
@@ -184,12 +161,17 @@ sensor:
     device_class: temperature
     icon: "mdi:radiator"
     lambda: |-
+      ESP_LOGD("terma", "b2 element raw (%d bytes): %s", (int) x.size(), format_hex_pretty(x).c_str());
       if (x.size() >= 4) {
-        float current_heater = ((x[0] * 255.0) + x[1]) / 10.0;
-        float target_heater = ((x[2] * 255.0) + x[3]) / 10.0;
+        // Little-endian uint16, value / 10 = °C (verified Terma Blue Line protocol).
+        float current_heater = (x[0] + x[1] * 256.0f) / 10.0f;
+        float target_heater = (x[2] + x[3] * 256.0f) / 10.0f;
         ESP_LOGD("terma", "Heater - Current: %.1f°C, Target: %.1f°C", current_heater, target_heater);
-        if (id(operating_mode) == 6) {
-          id(target_temp) = target_heater;
+        // Sync the radiator's own element target (e.g. changed with the physical
+        // buttons) back into the Rail Target number. publish_state only updates the
+        // shown value - it does NOT trigger set_action, so there is no write-back loop.
+        if (target_heater >= 30.0f && target_heater <= 60.0f) {
+          id(rail_target).publish_state(target_heater);
         }
         return current_heater;
       }
@@ -207,12 +189,18 @@ sensor:
     update_interval: 30s
     notify: false
     lambda: |-
+      // Log ALL bytes. The mode characteristic is 4 bytes wide; a bounded-timer
+      // countdown may live in bytes 1-3 (undocumented). Capture this in each mode
+      // (off / continuous / timed / schedule) to find the timer discriminator.
+      ESP_LOGD("terma", "b3 mode raw (%d bytes): %s", (int) x.size(), format_hex_pretty(x).c_str());
       if (x.size() >= 1) {
         int mode = x[0];
-        ESP_LOGD("terma", "Operating mode: %d (0=off, 5=room, 6=heater)", mode);
         id(operating_mode) = mode;
-        id(power_state) = (mode != 0);
-        return (float)mode;
+        // Off is 0x00 (physical off) or 0x20 (off via app on newer firmware).
+        bool heating = (mode != 0x00 && mode != 0x20);
+        id(power_state) = heating;
+        ESP_LOGD("terma", "Operating mode: 0x%02X (%d) heating=%d", mode, mode, heating);
+        return (float) mode;
       }
       return NAN;
 
@@ -224,89 +212,6 @@ sensor:
   - platform: uptime
     name: "Uptime"
     update_interval: 60s
-
-# ============================================
-# Climate Entity for Home Assistant
-# ============================================
-climate:
-  - platform: thermostat
-    name: "Bathroom Heater"
-    id: bathroom_thermostat
-    sensor: dht_temperature # change this to the room_temp_raw sensor if you do not have a separate DHT22
-    default_preset: Home
-    on_boot_restore_from: memory
-    
-    min_heating_off_time: 60s
-    min_heating_run_time: 60s
-    min_idle_time: 30s
-    
-    heat_action:
-      - if:
-          condition:
-            lambda: 'return id(is_connected);'
-          then:
-            - logger.log: "Climate: Heat action triggered"
-            - if:
-                condition:
-                  lambda: 'return !id(power_state);'
-                then:
-                  - lambda: |-
-                      id(power_state) = true;
-                      id(operating_mode) = 5;
-                  # Set temperature first
-                  - ble_client.ble_write:
-                      id: terma_moa_ble_client
-                      service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                      characteristic_uuid: 'd97352b1-d19e-11e2-9e96-0800200c9a66'
-                      value: !lambda |-
-                        // Set radiator to max room temp (30°C) so it heats continuously
-                        // The climate entity will control when to stop via idle_action
-                        int value = 300;  // 30.0 * 10
-                        uint8_t high = value / 255;
-                        uint8_t low = value % 255;
-                        return {0, 0, high, low};
-                  - delay: 500ms
-                  # Set mode to 5 (room temperature)
-                  - ble_client.ble_write:
-                      id: terma_moa_ble_client
-                      service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                      characteristic_uuid: 'd97352b3-d19e-11e2-9e96-0800200c9a66'
-                      value: [5]
-    
-    idle_action:
-      - if:
-          condition:
-            lambda: 'return id(is_connected);'
-          then:
-            - logger.log: "Climate: Idle action triggered - turning off"
-            - if:
-                condition:
-                  lambda: 'return id(power_state);'
-                then:
-                  - lambda: |-
-                      id(power_state) = false;
-                      id(operating_mode) = 0;
-                  - ble_client.ble_write:
-                      id: terma_moa_ble_client
-                      service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                      characteristic_uuid: 'd97352b3-d19e-11e2-9e96-0800200c9a66'
-                      value: [0]
-    
-    heat_deadband: 0.5  # Start heating 0.5°C below target
-    heat_overrun: 0.5   # Stop heating 0.5°C above target
-    
-    preset:
-      - name: Home
-        default_target_temperature_low: 21
-      - name: Away
-        default_target_temperature_low: 16
-      - name: Boost
-        default_target_temperature_low: 24
-    
-    visual:
-      min_temperature: 15
-      max_temperature: 30
-      temperature_step: 0.5
 
 # Binary Sensors
 binary_sensor:
@@ -330,10 +235,63 @@ binary_sensor:
       return id(power_state);
     device_class: heat
 
-# Switches - for manual override if needed or preferred
+  - platform: template
+    name: "Heating Without Timer"
+    id: heating_without_timer
+    device_class: problem
+    lambda: |-
+      // True when the radiator is heating in a mode that will NOT auto-off, i.e.
+      // it will stay on until something turns it off. Observed on this firmware:
+      //   0x00 / 0x20 = off,  0x09 = physical timer (bounded, auto-off, red light),
+      //   0x21 = manual / HA-driven continuous heating (no auto-off).
+      // Anything on that is not the known timer value is treated as "no timer" so
+      // we err toward alerting. Add other timer values here if you find them.
+      int m = id(operating_mode);
+      bool off = (m == 0x00 || m == 0x20);
+      bool timer = (m == 0x09);
+      return (!off && !timer);
+
+# ============================================
+# Rail target temperature (native element regulation)
+# ============================================
+# The radiator itself holds the element at this temperature in mode 6. Changing
+# this while the radiator is ON pushes the new target to the device immediately.
+number:
+  - platform: template
+    name: "Rail Target Temperature"
+    id: rail_target
+    icon: "mdi:thermometer"
+    unit_of_measurement: "°C"
+    min_value: 30
+    max_value: 60
+    # 5 discrete levels matching the radiator's physical buttons: 30 / 37.5 / 45 / 52.5 / 60
+    step: 7.5
+    initial_value: 45
+    restore_value: true
+    optimistic: true
+    set_action:
+      - if:
+          condition:
+            lambda: 'return id(is_connected) && id(power_state);'
+          then:
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
+                characteristic_uuid: 'd97352b2-d19e-11e2-9e96-0800200c9a66'
+                value: !lambda |-
+                  // Element target = little-endian uint16 (°C * 10) in bytes 2-3.
+                  // Use x (the just-set value): the number's .state is not updated
+                  // until AFTER set_action runs, so reading .state here lags by one.
+                  uint16_t v = (uint16_t)(x * 10.0f);
+                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+            - logger.log:
+                format: "Rail target updated to %.1f°C (pushed to radiator)"
+                args: ['x']
+
+# Switches - radiator on/off (radiator self-regulates the element in mode 6)
 switch:
   - platform: template
-    name: "Radiator Power (Manual)"
+    name: "Radiator Power"
     id: power_switch
     icon: "mdi:power"
     optimistic: false
@@ -344,25 +302,26 @@ switch:
           condition:
             lambda: 'return id(is_connected);'
           then:
-            - logger.log: "Manual: Turning power ON (mode 5 - room temp)"
+            - logger.log: "Radiator ON (manual/continuous 0x21, target from Rail Target)"
             - lambda: |-
                 id(power_state) = true;
-                id(operating_mode) = 5;
+                id(operating_mode) = 0x21;
             - ble_client.ble_write:
                 id: terma_moa_ble_client
                 service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                characteristic_uuid: 'd97352b1-d19e-11e2-9e96-0800200c9a66'
+                characteristic_uuid: 'd97352b2-d19e-11e2-9e96-0800200c9a66'
                 value: !lambda |-
-                  int value = 300;  // 30°C max
-                  uint8_t high = value / 255;
-                  uint8_t low = value % 255;
-                  return {0, 0, high, low};
+                  // Element target from the Rail Target number: little-endian uint16 (°C * 10).
+                  uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
+                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
             - delay: 500ms
             - ble_client.ble_write:
                 id: terma_moa_ble_client
                 service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
                 characteristic_uuid: 'd97352b3-d19e-11e2-9e96-0800200c9a66'
-                value: [5]
+                # 0x21 (33) = manual / continuous ON for this firmware (mode 6 is
+                # not accepted - the radiator just flickers and reverts to off).
+                value: [33, 0, 0, 0]
           else:
             - logger.log: "Not connected - cannot turn on"
     turn_off_action:
@@ -370,7 +329,7 @@ switch:
           condition:
             lambda: 'return id(is_connected);'
           then:
-            - logger.log: "Manual: Turning power OFF"
+            - logger.log: "Radiator OFF"
             - lambda: |-
                 id(power_state) = false;
                 id(operating_mode) = 0;
@@ -378,7 +337,7 @@ switch:
                 id: terma_moa_ble_client
                 service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
                 characteristic_uuid: 'd97352b3-d19e-11e2-9e96-0800200c9a66'
-                value: [0]
+                value: [0, 0, 0, 0]
           else:
             - logger.log: "Not connected - cannot turn off"
 
@@ -389,20 +348,12 @@ button:
     icon: "mdi:bluetooth-off"
     entity_category: diagnostic
     on_press:
-      - logger.log: "Clearing all BLE bonds..."
-      - lambda: |-
-          int count = esp_ble_get_bond_device_num();
-          if (count > 0) {
-            esp_ble_bond_dev_t *bonded_devices = (esp_ble_bond_dev_t *)malloc(sizeof(esp_ble_bond_dev_t) * count);
-            esp_ble_get_bond_device_list(&count, bonded_devices);
-            for (int i = 0; i < count; i++) {
-              esp_ble_remove_bond_device(bonded_devices[i].bd_addr);
-              ESP_LOGI("ble", "Removed bond %d", i);
-            }
-            free(bonded_devices);
-          }
-          ESP_LOGI("ble", "Cleared %d bonded devices", count);
-      - logger.log: "BLE bonds cleared - restart ESP and put radiator in pairing mode"
+      - logger.log: "Clearing BLE bond for the radiator..."
+      # Native replacement for the old raw esp_ble_remove_bond_device lambda.
+      # Removes the bond for this radiator (sufficient for a single-device setup).
+      - ble_client.remove_bond:
+          id: terma_moa_ble_client
+      - logger.log: "BLE bond cleared - restart ESP and put radiator in pairing mode"
 
   - platform: restart
     name: "Restart"
@@ -416,11 +367,26 @@ text_sensor:
     lambda: |-
       if (!id(is_connected)) {
         return {"Disconnected"};
-      } else if (id(power_state)) {
-        std::string mode_str = (id(operating_mode) == 5) ? "Room Mode" : "Element Mode";
-        return {mode_str + " - Heating"};
-      } else {
-        return {"Standby"};
+      }
+      int m = id(operating_mode);
+      switch (m) {
+        case 0x00:
+        case 0x20:
+          return {"Standby"};
+        case 0x09:  // physical timer button: bounded, auto-off (red light)
+          return {"Timer - Heating (auto-off)"};
+        case 0x21:  // manual / HA-driven: continuous, no auto-off
+          return {"Manual - Heating (no timer)"};
+        // Legacy / older-firmware values, kept for safety:
+        case 5: return {"Manual Room - Heating"};
+        case 6: return {"Manual Element - Heating"};
+        case 7: return {"Schedule Room - Heating"};
+        case 8: return {"Schedule Element - Heating"};
+        default: {
+          char buf[24];
+          snprintf(buf, sizeof(buf), "On - mode 0x%02X", m);
+          return {std::string(buf)};
+        }
       }
     update_interval: 5s
 
