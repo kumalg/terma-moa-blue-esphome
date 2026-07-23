@@ -101,6 +101,20 @@ globals:
     type: int
     restore_value: yes
     initial_value: "0"
+  # Timer detection: b6 counts down while a timer runs and freezes when it stops,
+  # so we infer "timer active" by watching the remaining value change between reads.
+  - id: timer_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: timer_prev_remaining
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: timer_stale
+    type: int
+    restore_value: no
+    initial_value: "0"
 
 # ============================================
 # BLE Sensors from Radiator
@@ -191,6 +205,45 @@ sensor:
       }
       return NAN;
 
+  # Timer countdown (reads b6 characteristic). Bytes 0-1 = remaining seconds,
+  # bytes 2-3 = total duration. Only meaningful while a timer is running - the value
+  # is stale (holds the last timer) when no timer is active.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: terma_moa_ble_client
+    id: timer_remaining
+    name: "Timer Remaining"
+    internal: false
+    service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+    characteristic_uuid: "d97352b6-d19e-11e2-9e96-0800200c9a66"
+    update_interval: 10s
+    notify: false
+    unit_of_measurement: "min"
+    accuracy_decimals: 0
+    icon: "mdi:timer-sand"
+    lambda: |-
+      if (x.size() >= 4) {
+        int remaining_s = x[0] + x[1] * 256;
+        int total_s = x[2] + x[3] * 256;
+        // A running timer counts down; a stopped one leaves b6 frozen. Infer
+        // "active" from whether the remaining value changes between reads.
+        int prev = id(timer_prev_remaining);
+        if (prev >= 0) {
+          if (remaining_s != prev) {
+            id(timer_active) = true;  // changed = counting down (or a new timer set)
+            id(timer_stale) = 0;
+          } else {
+            id(timer_stale) += 1;
+            if (id(timer_stale) >= 3) id(timer_active) = false;  // frozen ~30s = no timer
+          }
+        }
+        id(timer_prev_remaining) = remaining_s;
+        ESP_LOGD("terma", "Timer: %d s remaining / %d s total (active=%d)",
+                 remaining_s, total_s, id(timer_active));
+        return remaining_s / 60.0f;
+      }
+      return NAN;
+
   # Other sensors
   - platform: wifi_signal
     name: "WiFi Signal"
@@ -227,16 +280,13 @@ binary_sensor:
     id: heating_without_timer
     device_class: problem
     lambda: |-
-      // True when the radiator is heating in a mode that will NOT auto-off, i.e.
-      // it will stay on until something turns it off. Observed on this firmware:
-      //   0x00 / 0x20 = off,  0x09 = physical timer (bounded, auto-off, red light),
-      //   0x21 = manual / HA-driven continuous heating (no auto-off).
-      // Anything on that is not the known timer value is treated as "no timer" so
-      // we err toward alerting. Add other timer values here if you find them.
+      // True when heating in a mode that will NOT auto-off. A timer is active either
+      // via the physical timer mode (0x09) or the app/HA countdown (b6 decrementing,
+      // tracked as timer_active). Off is 0x00 / 0x20.
       int m = id(operating_mode);
       bool off = (m == 0x00 || m == 0x20);
-      bool timer = (m == 0x09);
-      return (!off && !timer);
+      bool has_timer = id(timer_active) || (m == 0x09);
+      return (!off && !has_timer);
 
 # ============================================
 # Rail target temperature (native element regulation)
@@ -274,6 +324,19 @@ number:
             - logger.log:
                 format: "Rail target updated to %.1f°C (pushed to radiator)"
                 args: ["x"]
+
+  # How long the "Start Timer" button runs the bounded auto-off timer.
+  - platform: template
+    name: "Timer Duration"
+    id: timer_minutes
+    icon: "mdi:timer-cog-outline"
+    unit_of_measurement: "min"
+    min_value: 15
+    max_value: 180
+    step: 15
+    initial_value: 60
+    restore_value: true
+    optimistic: true
 
 # Switches - radiator on/off (radiator self-regulates the element in mode 6)
 switch:
@@ -330,38 +393,55 @@ switch:
 
 # Buttons
 button:
-  # Start the radiator's bounded auto-off timer (mode 0x09 - the same value the
-  # physical timer button produces: red light, auto-off). Heats at the Rail Target
-  # temperature. NOTE: writing 0x09 is best-effort (mirrors the observed state);
-  # verify on-device that it actually engages the timer and auto-offs. The countdown
-  # duration is set by the radiator, not by us.
+  # Start a bounded auto-off timer, reproducing the exact write sequence the Terma
+  # app sends (captured via BLE snoop): turn on (b3=0x21) -> set countdown
+  # (b6=[secs,secs]) -> set element target (b2) -> set running mode (b3=0x05). The
+  # final b3=0x05 write is what actually starts the countdown. Duration comes from
+  # "Timer Duration", temperature from "Rail Target Temperature".
   - platform: template
     name: "Start Timer"
-    icon: "mdi:timer"
+    icon: "mdi:timer-play"
     on_press:
       - if:
           condition:
             lambda: "return id(is_connected);"
           then:
-            - logger.log: "Starting timer mode (0x09)"
-            - lambda: |-
-                id(power_state) = true;
-                id(operating_mode) = 0x09;
+            - logger.log: "Start Timer: replaying app sequence (on -> duration -> temp -> run)"
+            # 1) turn on (manual)
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
+                value: [33, 0, 0, 0] # 0x21
+            - delay: 400ms
+            # 2) countdown: b6 = [remaining_s, total_s], both = duration
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b6-d19e-11e2-9e96-0800200c9a66"
+                value: !lambda |-
+                  uint16_t s = (uint16_t)(id(timer_minutes).state * 60.0f);
+                  return {(uint8_t)(s & 0xFF), (uint8_t)(s >> 8),
+                          (uint8_t)(s & 0xFF), (uint8_t)(s >> 8)};
+            - delay: 400ms
+            # 3) element target temperature (from Rail Target)
             - ble_client.ble_write:
                 id: terma_moa_ble_client
                 service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
                 characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
                 value: !lambda |-
-                  // Element target from the Rail Target number: little-endian uint16 (°C * 10).
                   uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
                   return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
-            - delay: 500ms
+            - delay: 400ms
+            # 4) running mode 0x05 - this final write starts the countdown
             - ble_client.ble_write:
                 id: terma_moa_ble_client
                 service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
                 characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
-                # 0x09 (9) = timer mode observed when the physical timer button is pressed.
-                value: [9, 0, 0, 0]
+                value: [5, 0, 0, 0]
+            - lambda: |-
+                id(power_state) = true;
+                id(operating_mode) = 0x05;
           else:
             - logger.log: "Not connected - cannot start timer"
 
@@ -391,25 +471,14 @@ text_sensor:
         return {"Disconnected"};
       }
       int m = id(operating_mode);
-      switch (m) {
-        case 0x00:
-        case 0x20:
-          return {"Standby"};
-        case 0x09:  // physical timer button: bounded, auto-off (red light)
-          return {"Timer - Heating (auto-off)"};
-        case 0x21:  // manual / HA-driven: continuous, no auto-off
-          return {"Manual - Heating (no timer)"};
-        // Legacy / older-firmware values, kept for safety:
-        case 5: return {"Manual Room - Heating"};
-        case 6: return {"Manual Element - Heating"};
-        case 7: return {"Schedule Room - Heating"};
-        case 8: return {"Schedule Element - Heating"};
-        default: {
-          char buf[24];
-          snprintf(buf, sizeof(buf), "On - mode 0x%02X", m);
-          return {std::string(buf)};
-        }
+      if (m == 0x00 || m == 0x20) {
+        return {"Standby"};
       }
+      // Heating. Distinguish an auto-off timer (physical 0x09, or the b6 countdown)
+      // from continuous heating. The room/element scale is set by the Rail Target,
+      // not the mode byte, so we don't label it here.
+      bool has_timer = id(timer_active) || (m == 0x09);
+      return {has_timer ? "Heating (timer - auto-off)" : "Heating (no timer)"};
     update_interval: 5s
 
   - platform: wifi_info
