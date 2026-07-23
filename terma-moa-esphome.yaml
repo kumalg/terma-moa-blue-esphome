@@ -142,6 +142,11 @@ sensor:
         float current_room = (x[0] + x[1] * 256.0f) / 10.0f;
         float target_room = (x[2] + x[3] * 256.0f) / 10.0f;
         ESP_LOGD("terma", "Room - Current: %.1f°C, Target: %.1f°C", current_room, target_room);
+        // Sync the radiator's room target back into the Room Target number (like b2
+        // does for the element). publish_state doesn't trigger set_action, so no loop.
+        if (target_room >= 15.0f && target_room <= 30.0f) {
+          id(room_target).publish_state(target_room);
+        }
         return current_room;
       }
       return NAN;
@@ -200,6 +205,14 @@ sensor:
         // Off is 0x00 (physical off) or 0x20 (off via app on newer firmware).
         bool heating = (mode != 0x00 && mode != 0x20);
         id(power_state) = heating;
+        // Reflect the device's regulation mode in the Heat Mode select (room 0x11/0x03,
+        // element 0x21/0x05). publish_state updates the shown value only - it does not
+        // trigger the select's set_action, so there's no write-back loop.
+        if (mode == 0x11 || mode == 0x03) {
+          id(heat_mode).publish_state("Room");
+        } else if (mode == 0x21 || mode == 0x05) {
+          id(heat_mode).publish_state("Element");
+        }
         ESP_LOGD("terma", "Operating mode: 0x%02X (%d) heating=%d", mode, mode, heating);
         return (float) mode;
       }
@@ -289,15 +302,63 @@ binary_sensor:
       return (!off && !has_timer);
 
 # ============================================
-# Rail target temperature (native element regulation)
+# Heat mode + target temperatures
 # ============================================
-# The radiator itself holds the element at this temperature in mode 6. Changing
-# this while the radiator is ON pushes the new target to the device immediately.
-number:
+# Element = the radiator holds the heating element at the target (30-60C, written
+# to b2). Room = it holds the room air at the target (15-30C, using the radiator's
+# built-in sensor, written to b1). Heat Mode selects which is used by the Radiator
+# Power switch and the Start Timer button.
+select:
   - platform: template
-    name: "Rail Target Temperature"
+    name: "Heat Mode"
+    id: heat_mode
+    icon: "mdi:radiator"
+    options:
+      - "Element"
+      - "Room"
+    initial_option: "Element"
+    restore_value: true
+    optimistic: true
+    set_action:
+      # Changing Heat Mode while the radiator is ON switches it live: write the target
+      # to the new mode's characteristic, then its manual mode byte (room 0x11 /
+      # element 0x21). x = the newly selected option. When off this is a no-op and the
+      # choice just applies on the next Radiator Power / Start Timer.
+      - if:
+          condition:
+            lambda: "return id(is_connected) && id(power_state);"
+          then:
+            - lambda: 'id(operating_mode) = (x == "Room") ? 0x11 : 0x21;'
+            - if:
+                condition:
+                  lambda: 'return x == "Room";'
+                then:
+                  - ble_client.ble_write:
+                      id: terma_moa_ble_client
+                      service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                      characteristic_uuid: "d97352b1-d19e-11e2-9e96-0800200c9a66"
+                      value: !lambda |-
+                        uint16_t v = (uint16_t)(id(room_target).state * 10.0f);
+                        return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+                else:
+                  - ble_client.ble_write:
+                      id: terma_moa_ble_client
+                      service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                      characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
+                      value: !lambda |-
+                        uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
+                        return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+            - delay: 300ms
+            - script.execute:
+                id: set_mode
+                m: !lambda "return id(operating_mode);"
+
+number:
+  # Element target (30-60C) - used when Heat Mode = Element.
+  - platform: template
+    name: "Element Target Temperature"
     id: rail_target
-    icon: "mdi:thermometer"
+    icon: "mdi:radiator"
     unit_of_measurement: "°C"
     min_value: 30
     max_value: 60
@@ -316,14 +377,36 @@ number:
                 service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
                 characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
                 value: !lambda |-
-                  // Element target = little-endian uint16 (°C * 10) in bytes 2-3.
-                  // Use x (the just-set value): the number's .state is not updated
-                  // until AFTER set_action runs, so reading .state here lags by one.
+                  // Element target -> b2, little-endian uint16 (°C * 10) in bytes 2-3.
+                  // Use x (the just-set value): .state lags until after set_action runs.
                   uint16_t v = (uint16_t)(x * 10.0f);
                   return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
-            - logger.log:
-                format: "Rail target updated to %.1f°C (pushed to radiator)"
-                args: ["x"]
+
+  # Room target (15-30C) - used when Heat Mode = Room.
+  - platform: template
+    name: "Room Target Temperature"
+    id: room_target
+    icon: "mdi:home-thermometer"
+    unit_of_measurement: "°C"
+    min_value: 15
+    max_value: 30
+    step: 0.5
+    initial_value: 21
+    restore_value: true
+    optimistic: true
+    set_action:
+      - if:
+          condition:
+            lambda: "return id(is_connected) && id(power_state);"
+          then:
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b1-d19e-11e2-9e96-0800200c9a66"
+                value: !lambda |-
+                  // Room target -> b1, little-endian uint16 (°C * 10) in bytes 2-3.
+                  uint16_t v = (uint16_t)(x * 10.0f);
+                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
 
   # How long the "Start Timer" button runs the bounded auto-off timer.
   - platform: template
@@ -337,6 +420,42 @@ number:
     initial_value: 60
     restore_value: true
     optimistic: true
+
+# Reusable BLE writes for room/element (the characteristic UUID can't be templated,
+# so branch on Heat Mode here and reuse from the switch + Start Timer button).
+script:
+  # Push the active mode's target temperature to its characteristic (b1 room / b2 element).
+  - id: push_target
+    then:
+      - if:
+          condition:
+            lambda: 'return id(heat_mode).current_option() == "Room";'
+          then:
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b1-d19e-11e2-9e96-0800200c9a66"
+                value: !lambda |-
+                  uint16_t v = (uint16_t)(id(room_target).state * 10.0f);
+                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+          else:
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
+                value: !lambda |-
+                  uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
+                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+  # Write an operating-mode byte to b3.
+  - id: set_mode
+    parameters:
+      m: int
+    then:
+      - ble_client.ble_write:
+          id: terma_moa_ble_client
+          service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+          characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
+          value: !lambda "return {(uint8_t) m, 0, 0, 0};"
 
 # Switches - radiator on/off (radiator self-regulates the element in mode 6)
 switch:
@@ -352,26 +471,18 @@ switch:
           condition:
             lambda: "return id(is_connected);"
           then:
-            - logger.log: "Radiator ON (manual/continuous 0x21, target from Rail Target)"
+            # Manual (continuous) heating in the selected mode. Mode byte: room 0x11 /
+            # element 0x21; target -> b1 (room) or b2 (element) via push_target.
             - lambda: |-
+                bool room = id(heat_mode).current_option() == "Room";
                 id(power_state) = true;
-                id(operating_mode) = 0x21;
-            - ble_client.ble_write:
-                id: terma_moa_ble_client
-                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
-                characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
-                value: !lambda |-
-                  // Element target from the Rail Target number: little-endian uint16 (°C * 10).
-                  uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
-                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+                id(operating_mode) = room ? 0x11 : 0x21;
+            - logger.log: "Radiator ON (manual, per Heat Mode)"
+            - script.execute: push_target
             - delay: 500ms
-            - ble_client.ble_write:
-                id: terma_moa_ble_client
-                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
-                characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
-                # 0x21 (33) = manual / continuous ON for this firmware (mode 6 is
-                # not accepted - the radiator just flickers and reverts to off).
-                value: [33, 0, 0, 0]
+            - script.execute:
+                id: set_mode
+                m: !lambda 'return id(heat_mode).current_option() == "Room" ? 0x11 : 0x21;'
           else:
             - logger.log: "Not connected - cannot turn on"
     turn_off_action:
@@ -393,11 +504,11 @@ switch:
 
 # Buttons
 button:
-  # Start a bounded auto-off timer, reproducing the exact write sequence the Terma
-  # app sends (captured via BLE snoop): turn on (b3=0x21) -> set countdown
-  # (b6=[secs,secs]) -> set element target (b2) -> set running mode (b3=0x05). The
-  # final b3=0x05 write is what actually starts the countdown. Duration comes from
-  # "Timer Duration", temperature from "Rail Target Temperature".
+  # Start a bounded auto-off timer, reproducing the write sequence the Terma app
+  # sends (captured via BLE snoop): on (manual mode) -> countdown (b6=[secs,secs]) ->
+  # target temp (b1/b2) -> run mode. The final run-mode write starts the countdown.
+  # Mode bytes: room = 0x11 then 0x03, element = 0x21 then 0x05. Duration from
+  # "Timer Duration"; temperature from the active mode's target number.
   - platform: template
     name: "Start Timer"
     icon: "mdi:timer-play"
@@ -407,12 +518,10 @@ button:
             lambda: "return id(is_connected);"
           then:
             - logger.log: "Start Timer: replaying app sequence (on -> duration -> temp -> run)"
-            # 1) turn on (manual)
-            - ble_client.ble_write:
-                id: terma_moa_ble_client
-                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
-                characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
-                value: [33, 0, 0, 0] # 0x21
+            # 1) turn on (manual): room 0x11 / element 0x21
+            - script.execute:
+                id: set_mode
+                m: !lambda 'return id(heat_mode).current_option() == "Room" ? 0x11 : 0x21;'
             - delay: 400ms
             # 2) countdown: b6 = [remaining_s, total_s], both = duration
             - ble_client.ble_write:
@@ -424,24 +533,17 @@ button:
                   return {(uint8_t)(s & 0xFF), (uint8_t)(s >> 8),
                           (uint8_t)(s & 0xFF), (uint8_t)(s >> 8)};
             - delay: 400ms
-            # 3) element target temperature (from Rail Target)
-            - ble_client.ble_write:
-                id: terma_moa_ble_client
-                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
-                characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
-                value: !lambda |-
-                  uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
-                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+            # 3) target temp (b1 room / b2 element)
+            - script.execute: push_target
             - delay: 400ms
-            # 4) running mode 0x05 - this final write starts the countdown
-            - ble_client.ble_write:
-                id: terma_moa_ble_client
-                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
-                characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
-                value: [5, 0, 0, 0]
+            # 4) run mode - this final write starts the countdown: room 0x03 / element 0x05
+            - script.execute:
+                id: set_mode
+                m: !lambda 'return id(heat_mode).current_option() == "Room" ? 0x03 : 0x05;'
             - lambda: |-
+                bool room = id(heat_mode).current_option() == "Room";
                 id(power_state) = true;
-                id(operating_mode) = 0x05;
+                id(operating_mode) = room ? 0x03 : 0x05;
           else:
             - logger.log: "Not connected - cannot start timer"
 
