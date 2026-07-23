@@ -1,51 +1,39 @@
 substitutions:
-  device_name: terma-moa-blue
-  friendly_name: "Terma Moa BLue Radiator"
   # Replace with your Terma MOA Blue MAC address - see on android settings or the nrf connect app
-  radiator_mac: "xx:xx:xx:xx:xx:xx"
+  radiator_mac: !secret xiao_esp32_c6__radiator_mac
 
 esphome:
-  name: ${device_name}
-  friendly_name: ${friendly_name}
-  platformio_options:
-    board_build.flash_mode: dio
+  name: xiao-esp32-c6
+  friendly_name: XIAO ESP32 C6
+  min_version: 2026.4.0
+  name_add_mac_suffix: false
 
-# Local external component that proactively requests BLE link encryption on
-# connect (replaces the old terma_ble_helper.h + on_connect encryption lambda).
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf
+
 external_components:
   - source:
       type: local
       path: components
 
-esp32:
-  board: esp32dev
-  framework:
-    type: esp_idf
-
-# Enable logging - debug mode for first release while I complete testing
+# Enable logging
 logger:
-  level: DEBUG
-  logs:
-    esp32_ble_client: DEBUG
-    ble_client: DEBUG
 
-# Enable the Home Assistant API
+# Enable Home Assistant API
 api:
-#  encryption:
-#    key: !secret api_encryption_key # uncomment this if you use an encryption key.
+  encryption:
+    key: !secret xiao_esp32_c6__encryption_key
 
+# Allow Over-The-Air updates
 ota:
   - platform: esphome
-#    password: !secret ota_password # uncomment this if you use an ota password.
+    password: !secret xiao_esp32_c6__ota_password
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  
-  # Enable fallback hotspot
-  ap:
-    ssid: "${device_name} Fallback"
-    password: !secret ap_password
 
 captive_portal:
 
@@ -87,7 +75,7 @@ ble_client:
       then:
         - logger.log:
             format: "Passkey notification received: %d"
-            args: ['passkey']
+            args: ["passkey"]
     on_disconnect:
       then:
         - logger.log: "BLE client disconnected!"
@@ -104,21 +92,20 @@ globals:
   - id: power_state
     type: bool
     restore_value: yes
-    initial_value: 'false'
+    initial_value: "false"
   - id: is_connected
     type: bool
     restore_value: no
-    initial_value: 'false'
+    initial_value: "false"
   - id: operating_mode
     type: int
     restore_value: yes
-    initial_value: '0'
+    initial_value: "0"
 
 # ============================================
 # BLE Sensors from Radiator
 # ============================================
 sensor:
-
   # Room temperature sensor (reads from b1 characteristic) - radiator's built-in sensor.  This sensor is not accurate.
   - platform: ble_client
     type: characteristic
@@ -126,8 +113,8 @@ sensor:
     id: room_temp_raw
     name: "Radiator Room Sensor"
     internal: false
-    service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-    characteristic_uuid: 'd97352b1-d19e-11e2-9e96-0800200c9a66'
+    service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+    characteristic_uuid: "d97352b1-d19e-11e2-9e96-0800200c9a66"
     update_interval: 30s
     notify: false
     unit_of_measurement: "°C"
@@ -152,8 +139,8 @@ sensor:
     id: heater_temp_raw
     name: "Radiator Element Temperature"
     internal: false
-    service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-    characteristic_uuid: 'd97352b2-d19e-11e2-9e96-0800200c9a66'
+    service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+    characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
     update_interval: 30s
     notify: false
     unit_of_measurement: "°C"
@@ -184,8 +171,8 @@ sensor:
     id: mode_raw
     name: "Operating Mode Raw"
     internal: true
-    service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-    characteristic_uuid: 'd97352b3-d19e-11e2-9e96-0800200c9a66'
+    service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+    characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
     update_interval: 30s
     notify: false
     lambda: |-
@@ -272,12 +259,12 @@ number:
     set_action:
       - if:
           condition:
-            lambda: 'return id(is_connected) && id(power_state);'
+            lambda: "return id(is_connected) && id(power_state);"
           then:
             - ble_client.ble_write:
                 id: terma_moa_ble_client
-                service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                characteristic_uuid: 'd97352b2-d19e-11e2-9e96-0800200c9a66'
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
                 value: !lambda |-
                   // Element target = little-endian uint16 (°C * 10) in bytes 2-3.
                   // Use x (the just-set value): the number's .state is not updated
@@ -286,7 +273,7 @@ number:
                   return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
             - logger.log:
                 format: "Rail target updated to %.1f°C (pushed to radiator)"
-                args: ['x']
+                args: ["x"]
 
 # Switches - radiator on/off (radiator self-regulates the element in mode 6)
 switch:
@@ -300,7 +287,7 @@ switch:
     turn_on_action:
       - if:
           condition:
-            lambda: 'return id(is_connected);'
+            lambda: "return id(is_connected);"
           then:
             - logger.log: "Radiator ON (manual/continuous 0x21, target from Rail Target)"
             - lambda: |-
@@ -308,8 +295,8 @@ switch:
                 id(operating_mode) = 0x21;
             - ble_client.ble_write:
                 id: terma_moa_ble_client
-                service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                characteristic_uuid: 'd97352b2-d19e-11e2-9e96-0800200c9a66'
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
                 value: !lambda |-
                   // Element target from the Rail Target number: little-endian uint16 (°C * 10).
                   uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
@@ -317,8 +304,8 @@ switch:
             - delay: 500ms
             - ble_client.ble_write:
                 id: terma_moa_ble_client
-                service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                characteristic_uuid: 'd97352b3-d19e-11e2-9e96-0800200c9a66'
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
                 # 0x21 (33) = manual / continuous ON for this firmware (mode 6 is
                 # not accepted - the radiator just flickers and reverts to off).
                 value: [33, 0, 0, 0]
@@ -327,7 +314,7 @@ switch:
     turn_off_action:
       - if:
           condition:
-            lambda: 'return id(is_connected);'
+            lambda: "return id(is_connected);"
           then:
             - logger.log: "Radiator OFF"
             - lambda: |-
@@ -335,14 +322,49 @@ switch:
                 id(operating_mode) = 0;
             - ble_client.ble_write:
                 id: terma_moa_ble_client
-                service_uuid: 'd97352b0-d19e-11e2-9e96-0800200c9a66'
-                characteristic_uuid: 'd97352b3-d19e-11e2-9e96-0800200c9a66'
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
                 value: [0, 0, 0, 0]
           else:
             - logger.log: "Not connected - cannot turn off"
 
 # Buttons
 button:
+  # Start the radiator's bounded auto-off timer (mode 0x09 - the same value the
+  # physical timer button produces: red light, auto-off). Heats at the Rail Target
+  # temperature. NOTE: writing 0x09 is best-effort (mirrors the observed state);
+  # verify on-device that it actually engages the timer and auto-offs. The countdown
+  # duration is set by the radiator, not by us.
+  - platform: template
+    name: "Start Timer"
+    icon: "mdi:timer"
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(is_connected);"
+          then:
+            - logger.log: "Starting timer mode (0x09)"
+            - lambda: |-
+                id(power_state) = true;
+                id(operating_mode) = 0x09;
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b2-d19e-11e2-9e96-0800200c9a66"
+                value: !lambda |-
+                  // Element target from the Rail Target number: little-endian uint16 (°C * 10).
+                  uint16_t v = (uint16_t)(id(rail_target).state * 10.0f);
+                  return {0x00, 0x00, (uint8_t)(v & 0xFF), (uint8_t)(v >> 8)};
+            - delay: 500ms
+            - ble_client.ble_write:
+                id: terma_moa_ble_client
+                service_uuid: "d97352b0-d19e-11e2-9e96-0800200c9a66"
+                characteristic_uuid: "d97352b3-d19e-11e2-9e96-0800200c9a66"
+                # 0x09 (9) = timer mode observed when the physical timer button is pressed.
+                value: [9, 0, 0, 0]
+          else:
+            - logger.log: "Not connected - cannot start timer"
+
   - platform: template
     name: "Clear BLE Bonds"
     icon: "mdi:bluetooth-off"
